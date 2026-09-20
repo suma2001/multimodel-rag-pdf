@@ -29,15 +29,24 @@ from langchain_core.documents import Document
 from langchain_openai import ChatOpenAI, OpenAIEmbeddings
 from langchain_chroma import Chroma
 from langchain_text_splitters import RecursiveCharacterTextSplitter
+from uuid import uuid4
+import torch
+import open_clip
+from PIL import Image
+
 import base64
 from dotenv import load_dotenv
 
 PDF_PATH = "Azure-Kubernetes-Service.pdf"
 IMAGE_DIR = "extracted_images"
 CHROMA_DIR = "chroma_db"
+CLIP_CHROMA_DIR = "clip_chroma_db"
+CLIP_MODEL, _, CLIP_PREPROCESS = open_clip.create_model_and_transforms("ViT-B-32", pretrained="openai")
+CLIP_TOKENIZER = open_clip.get_tokenizer("ViT-B-32")
 
 load_dotenv()
 
+# Extract text and images from PDF
 def extract_pdf_elements(pdf_path: str, image_dir):
     '''
     Extracts the text blocks and images in the pdf.
@@ -95,6 +104,7 @@ def extract_pdf_elements(pdf_path: str, image_dir):
     pdf.close()
     return text_elements, image_elements
 
+# Chunk text elements
 def chunk_text(text_elements: list) -> list:
     splitter = RecursiveCharacterTextSplitter(
         chunk_size=1000,
@@ -104,16 +114,19 @@ def chunk_text(text_elements: list) -> list:
     chunks = []
 
     for doc in text_elements:
+        doc_id = str(uuid4())
         split_docs = splitter.split_documents([doc])
         for chunk in split_docs:
             chunk.metadata["type"] = "text"
+            chunk.metadata["doc_id"] = doc_id
         chunks.extend(split_docs)
     return chunks
 
 def encode_image(image_path: str) -> str:
     with open(image_path, "rb") as image_file:
         return base64.b64encode(image_file.read()).decode("utf-8")
-    
+
+# Describe image from gpt model
 def describe_image(image_path: str, page: int, source: str) -> Document:
     image_base64 = encode_image(image_path)
 
@@ -172,6 +185,35 @@ def describe_image(image_path: str, page: int, source: str) -> Document:
         },
     )
 
+# CLIP image embeddings
+def get_clip_image_embedding(image_path: str) -> list:
+
+    image = Image.open(image_path).convert("RGB")
+    image = CLIP_PREPROCESS(image).unsqueeze(0)
+
+    with torch.no_grad():
+        embedding = CLIP_MODEL.encode_image(image)
+
+    embedding = embedding / embedding.norm(
+        dim=-1,
+        keepdim=True,
+    )
+
+    return embedding[0].cpu().tolist()
+
+# CLIP text embeddings
+def get_clip_text_embedding(query: str) -> list:
+
+    text = CLIP_TOKENIZER([query])
+    with torch.no_grad():
+        embedding = CLIP_MODEL.encode_text(text)
+    embedding = embedding / embedding.norm(
+        dim=-1,
+        keepdim=True,
+    )
+    return embedding[0].cpu().tolist()
+
+# Build image documents
 def build_image_documents(image_elements: list) -> list:
 
     image_docs = []
@@ -181,15 +223,50 @@ def build_image_documents(image_elements: list) -> list:
             page=image["page"],
             source=image["source"],
         )
+        doc.metadata["doc_id"] = str(uuid4())
         image_docs.append(doc)
     return image_docs
 
+# Fetch CLIP images
+def retrieve_clip_images(clip_store, query: str, k: int = 3) -> list:
+    query_embedding = get_clip_text_embedding(query)
+    results = clip_store._collection.query(
+        query_embeddings=[query_embedding],
+        n_results=k,
+    )
+    documents = []
+    for metadata in results["metadatas"][0]:
+        documents.append(
+            Document(
+                page_content=metadata.get("description", ""),
+                metadata=metadata,
+            )
+        )
+    return documents
+
+# Build CLIP store
+def build_clip_store(image_docs: list):
+    clip_store = Chroma(
+        collection_name="clip_images",
+        embedding_function=None,
+        persist_directory=CLIP_CHROMA_DIR,
+    )
+
+    for doc in image_docs:
+        embedding = get_clip_image_embedding(doc.metadata["image_path"])
+        metadata = { **doc.metadata, "description": doc.page_content,}
+        clip_store._collection.add(
+            ids=[str(uuid4())],
+            embeddings=[embedding],
+            documents=[doc.page_content],
+            metadatas=[metadata],
+        )
+    return clip_store
+
+# Build vector store
 def build_vector_store(text_chunks: list,image_docs: list) -> Chroma:
-
     documents = text_chunks + image_docs
-
     embeddings = OpenAIEmbeddings(model="text-embedding-3-small")
-
     vector_store = Chroma.from_documents(
         documents=documents,
         embedding=embeddings,
@@ -198,30 +275,44 @@ def build_vector_store(text_chunks: list,image_docs: list) -> Chroma:
     )
     return vector_store
 
+# Retrieve documents
 def retrieve_documents(vector_store: Chroma, query: str, k: int = 5,) -> list:
-    results = vector_store.similarity_search(
-        query,
-        k=k,
-    )
+    results = vector_store.similarity_search(query, k=k)
     return results
 
-def build_multimodal_context(documents: list,) -> tuple[list, list]:
+# Build RAG pipeline
+def build_multimodal_rag():
+    # 1. Extract PDF
+    text_elements, image_elements = extract_pdf_elements(PDF_PATH, IMAGE_DIR)
+    print(f"Extracted text elements: {len(text_elements)}")
+    print(f"Extracted images: {len(image_elements)}")
+
+    # 2. Chunk text
+    text_chunks = chunk_text(text_elements)
+    print(f"Text chunks: {len(text_chunks)}")
+
+    # 3. Generate image descriptions
+    image_docs = build_image_documents(image_elements)
+    print(f"Image descriptions: {len(image_docs)}")
+
+    # 4. Existing OpenAI vector store
+    vector_store = build_vector_store(text_chunks, image_docs)
+
+    # 5. New CLIP image vector store
+    clip_store = build_clip_store(image_docs)
+    return vector_store, clip_store
+
+def build_multimodal_context(documents: list) -> tuple[list, list]:
 
     text_context = []
     image_paths = []
 
     for doc in documents:
         if doc.metadata.get("type") == "image":
-            image_paths.append(
-                doc.metadata["image_path"]
-            )
-            text_context.append(
-                f"[Image description]\n{doc.page_content}"
-            )
+            image_paths.append(doc.metadata["image_path"])
+            text_context.append(f"[Image description]\n{doc.page_content}")
         else:
-            text_context.append(
-                f"[Text]\n{doc.page_content}"
-            )
+            text_context.append(f"[Text]\n{doc.page_content}")
     return text_context, image_paths
 
 def generate_answer(query: str, documents: list,) -> str:
@@ -273,26 +364,7 @@ def generate_answer(query: str, documents: list,) -> str:
     )
     return response.content
 
-def build_multimodal_rag():
-
-    # 1. Extract PDF
-    text_elements, image_elements = extract_pdf_elements(PDF_PATH, IMAGE_DIR,)
-    print(f"Extracted text elements: {len(text_elements)}")
-    print(f"Extracted images: {len(image_elements)}")
-
-    # 2. Chunk text
-    text_chunks = chunk_text(text_elements)
-    print(f"Text chunks: {len(text_chunks)}")
-
-    # 3. Describe images
-    image_docs = build_image_documents(image_elements)
-    print(f"Image descriptions: {len(image_docs)}")
-
-    # 4. Build vector store
-    vector_store = build_vector_store(text_chunks, image_docs,)
-    return vector_store
-
-def run_qna(vector_store: Chroma):
+def run_qna(vector_store: Chroma, clip_store):
     while True:
         query = input("\nAsk a question (type 'exit' to quit): ").strip()
         if query.lower() == "exit":
@@ -302,22 +374,18 @@ def run_qna(vector_store: Chroma):
             continue
 
         # Retrieve relevant text/image descriptions
-        documents = retrieve_documents(
-            vector_store,
-            query,
-            k=5,
-        )
+        semantic_documents = retrieve_documents(vector_store, query, k=5)
+        clip_documents = retrieve_clip_images(clip_store, query, k=3)
+
+        documents = semantic_documents + clip_documents
 
         # Generate answer using retrieved context
-        answer = generate_answer(
-            query,
-            documents,
-        )
+        answer = generate_answer(query, documents)
 
         print("\nAnswer:")
         print(answer)
 
 if __name__ == "__main__":
-    vector_store = build_multimodal_rag()
-    run_qna(vector_store)
+    vector_store, clip_storage = build_multimodal_rag()
+    run_qna(vector_store, clip_storage)
     

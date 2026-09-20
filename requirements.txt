@@ -9,3 +9,6 @@ langchain-chroma
 chromadb
 sentence-transformers
 pymupdf
+open-clip-torch
+torch
+pillow
